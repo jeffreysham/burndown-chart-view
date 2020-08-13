@@ -33,37 +33,60 @@ class App extends React.Component {
 
     // Default state
     this.state = {
-      settings: {stroke: "#82ca9d", strokeWidth: "1"},
+      settings: {
+        stroke: "#82ca9d",
+        strokeWidth: "1",
+        statusColumn: {"status": true},
+        completionStatuses: "Done",
+        itemWeightColumn: null,
+        startDate: "",
+        endDate: ""
+      },
       graphData: [],
       boardIds: [],
+      itemIds: [],
     };
   };
 
   componentDidMount() {
-    // TODO: toggle for burn up vs burn down
     monday.listen("settings", res => {
       this.setState({ settings: res.data });
+      this.fetchItems(this.state.boardIds, this.state.itemIds);
     });
     monday.listen("context", contextResult => {
       this.setState({ boardIds: contextResult.data.boardIds });
       this.fetchItems(contextResult.data.boardIds, []);
     });
     monday.listen("itemIds", res => {
+      this.setState({ itemIds: res.data });
       this.fetchItems(this.state.boardIds, res.data);
     });
   };
 
   async fetchItems(boardIds, selectedItemIds) {
+    const weightColumnName = this.state.settings.itemWeightColumn ?
+      Object.keys(this.state.settings.itemWeightColumn):
+      [];
+
     // Get relevant item ids
-    const response = await this.getItems(boardIds, selectedItemIds);
+    const response = await this.getItems(
+      boardIds,
+      selectedItemIds,
+      weightColumnName);
     var itemIds = new Set();
     var itemIdToItemName = {};
+    var itemIdToItemWeight = {};
     if (response.data.boards[0].items.length > 0) {
       var items = response.data.boards[0].items;
       for (var i = 0; i < items.length; i++) {
         const itemId = parseInt(items[i].id);
         itemIds.add(itemId);
         itemIdToItemName[itemId] = items[i].name;
+        if (items[i].column_values) {
+          itemIdToItemWeight[itemId] = Number(items[i].column_values[0].text);
+        } else {
+          itemIdToItemWeight[itemId] = 1;
+        }
       }
     }
 
@@ -86,30 +109,74 @@ class App extends React.Component {
     // Build graph data
     var count = 0;
     var graphData = [];
+    var completionStatusesSet = new Set(this.state.settings.completionStatuses.split(","));
+    const statusColumnValue = this.state.settings.statusColumn ?
+      Object.keys(this.state.settings.statusColumn)[0] :
+      'status';
+    const startDateValue = this.state.settings.startDate === '' ?
+      null :
+      new Date(this.state.settings.startDate);
+    const endDateValue = this.state.settings.endDate === '' ?
+      null :
+      new Date(this.state.settings.endDate);
 
     for (var index = activityLogData.length - 1; index >= 0; index--) {
       const log = activityLogData[index];
-      const dateString = this.getDateString(new Date(log.created_at / 10000));
+      const logDateValue = new Date(log.created_at / 10000);
+      const dateString = this.getDateString(logDateValue);
       const logData = JSON.parse(log.data);
+
       if (log.event === 'create_pulse') {
         const pulseId = logData.pulse_id;
-        count++;
-        graphData.push({'time': dateString, 'value': count, 'itemName': itemIdToItemName[pulseId], 'itemStatus': 'Create'});
-      } else if (log.event === 'update_column_value') {
+        count += itemIdToItemWeight[pulseId];
+        if ((startDateValue === null || endDateValue === null) ||
+            (startDateValue <= logDateValue && logDateValue <= endDateValue))
+        {
+          graphData.push({
+            'time': dateString,
+            'value': count,
+            'itemName': itemIdToItemName[pulseId],
+            'itemStatus': 'Create'
+          });
+        }
+      } else if (log.event === 'update_column_value' &&
+          logData.column_id === statusColumnValue)
+      {
         const pulseId = logData.pulse_id;
+
         // Check if status is done
-        if (logData.column_id === 'status' && logData.value.label.text === 'Done') {
+        if (completionStatusesSet.has(logData.value.label.text)) {
           if (count > 0) {
-            count--;
+            count -= itemIdToItemWeight[pulseId];
           }
 
-          graphData.push({'time': dateString, 'value': count, 'itemName': itemIdToItemName[pulseId], 'itemStatus': 'Done'});
-        } else if (logData.column_id === 'status' &&
-            logData.previous_value != null &&
-            logData.previous_value.label.text === 'Done')
+          if ((startDateValue === null || endDateValue === null) ||
+              (startDateValue <= logDateValue && logDateValue <= endDateValue))
+          {
+            graphData.push({
+              'time': dateString,
+              'value': count,
+              'itemName': itemIdToItemName[pulseId],
+              'itemStatus': logData.value.label.text
+            });
+          }
+        } else if (logData.previous_value != null &&
+            completionStatusesSet.has(logData.previous_value.label.text))
         {
-          count++;
-          graphData.push({'time': dateString, 'value': count, 'itemName': itemIdToItemName[pulseId], 'itemStatus': logData.value.label.text});
+          if (!completionStatusesSet.has(logData.value.label.text)) {
+            count += itemIdToItemWeight[pulseId];
+          }
+
+          if ((startDateValue === null || endDateValue === null) ||
+              (startDateValue <= logDateValue && logDateValue <= endDateValue))
+          {
+            graphData.push({
+              'time': dateString,
+              'value': count,
+              'itemName': itemIdToItemName[pulseId],
+              'itemStatus': logData.value.label.text
+            });
+          }
         }
       }
     }
@@ -124,14 +191,28 @@ class App extends React.Component {
     return response;
   }
 
-  async getItems(boardIds, itemIds) {
+  async getItems(boardIds, itemIds, itemWeightColumns) {
+    var apiQuery = 'query ($boardIds: [Int]';
     if (itemIds.length > 0) {
-      const response = await monday.api(`query ($boardIds: [Int], $itemIds: [Int]) { boards (ids:$boardIds) { items(ids: $itemIds) { created_at name id state } } }`,
-        { variables: {boardIds, itemIds} });
+      apiQuery += ', $itemIds: [Int]'
+    }
+    apiQuery = apiQuery + ') { boards (ids:$boardIds) { ';
+    if (itemIds.length > 0) {
+      apiQuery += 'items(ids: $itemIds)';
+    } else {
+      apiQuery += 'items(limit: 100)';
+    }
+    if (itemWeightColumns.length > 0) {
+      apiQuery += ' { created_at name id column_values(ids:["' + itemWeightColumns[0] + '"]) { id text } } } }';
+    } else {
+      apiQuery += ' { created_at name id } } }';
+    }
+
+    if (itemIds.length > 0) {
+      const response = await monday.api(apiQuery, { variables: {boardIds, itemIds} });
       return response;
     } else {
-      const response = await monday.api(`query ($boardIds: [Int]) { boards (ids:$boardIds) { items(limit: 100) { created_at name id state } } }`,
-        { variables: {boardIds: boardIds} });
+      const response = await monday.api(apiQuery, { variables: {boardIds: boardIds} });
       return response;
     }
   }
@@ -151,8 +232,8 @@ class App extends React.Component {
     return (
       <div className="App">
         <LineChart
-          width={500}
-          height={300}
+          width={700}
+          height={350}
           data={this.state.graphData}
           margin={{
             top: 5, right: 30, left: 20, bottom: 5,
@@ -163,7 +244,7 @@ class App extends React.Component {
           <YAxis />
           <Tooltip content={<CustomTooltip/>}/>
           <Legend />
-          <Line name="# of Remaining Items"
+          <Line name="Item Weight"
                 type="monotone"
                 dataKey="value"
                 stroke={this.state.settings.lineColor}
